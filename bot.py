@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, \
@@ -16,13 +17,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # States for ConversationHandler
-WAITING_USERNAME, WAITING_PASSWORD = range(2)
+WAITING_USERNAME, WAITING_PASSWORD, WAITING_PROTOCOL, WAITING_INTERNAL_PORT, WAITING_EXTERNAL_PORT, WAITING_NEW_PASSWORD = range(
+    6)
 
 # Configuration
 CONFIG = {
     "BASE_URL": "https://api.7inet.com.cn",
     "BOT_TOKEN": "7613902246:AAF8yHzFXibLc8pHS8u7M8ZH3UfXPHSlTP0",
-    "ALLOWED_USER_IDS": [1880860457]  # Add your Telegram user ID here
+    "ALLOWED_USER_IDS": [1880860457]
 }
 
 
@@ -115,28 +117,47 @@ class VPSManager:
             system_info = {}
             card = soup.find('el-card', {'class': 'box-card'})
             if card:
-                info_text = card.text.strip()
-                for line in info_text.split('\n'):
+                status_font = card.find('font')
+                if status_font:
+                    system_info['运行状态'] = status_font.text.strip()
+
+                content = card.get_text('\n').strip()
+                lines = content.split('\n')
+
+                current_key = None
+                for line in lines:
                     line = line.strip()
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        system_info[key.strip()] = value.strip()
+                    if not line or line == '基本信息':
+                        continue
+
+                    if line.endswith(':'):
+                        current_key = line[:-1].strip()
+                    elif current_key:
+                        value = line.replace('\n', '').replace('<br/>', '').strip()
+                        if value:
+                            system_info[current_key] = value
+                            current_key = None
+
+                if '用户名: ' in content:
+                    system_info['用户名'] = content.split('用户名: ')[1].split('\n')[0].strip()
 
             # Extract port forwarding information
             ports = []
-            port_table = soup.find('table', {'class': 'table table-bordered table-hover'})
-            if port_table:
-                rows = port_table.find_all('tr')[1:]  # Skip header row
-                for row in rows:
-                    cols = row.find_all('td')
-                    if len(cols) >= 4:
-                        port = {
-                            'id': cols[0].text.strip(),
-                            'protocol': cols[1].text.strip(),
-                            'internal_addr': cols[2].text.strip(),
-                            'external_addr': cols[3].text.strip()
-                        }
-                        ports.append(port)
+            table_div = soup.find('div', {'class': 'table-responsive', 'id': 'listtable'})
+            if table_div:
+                table = table_div.find('table')
+                if table:
+                    rows = table.find_all('tr')[1:]
+                    for row in rows:
+                        cols = row.find_all('td')
+                        if len(cols) >= 4:
+                            port = {
+                                'id': cols[0].text.strip(),
+                                'protocol': cols[1].text.strip(),
+                                'internal_addr': cols[2].text.strip(),
+                                'external_addr': cols[3].text.strip()
+                            }
+                            ports.append(port)
 
             return {
                 'success': True,
@@ -161,6 +182,55 @@ class VPSManager:
             return {'success': True}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    async def add_port_forward(self, token: str, instance_id: str, protocol: str, internal_port: str,
+                               external_port: str) -> Dict:
+        """Add a new port forwarding rule"""
+        url = f"{CONFIG['BASE_URL']}/user/instance_control.do"
+        params = {
+            'token': token,
+            'id': instance_id,
+            '_senkinlxc_port': f"addport|{protocol}|{internal_port}|{external_port}"
+        }
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers)
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    async def delete_port_forward(self, token: str, instance_id: str, protocol: str, internal_port: str,
+                                  external_port: str) -> Dict:
+        """Delete a port forwarding rule"""
+        url = f"{CONFIG['BASE_URL']}/user/instance_control.do"
+        params = {
+            'token': token,
+            'id': instance_id,
+            '_senkinlxc_port': f"delport|{protocol}|{internal_port}|{external_port}"
+        }
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers)
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    async def change_password(self, token: str, instance_id: str, new_password: str) -> Dict:
+        """Change VPS password"""
+        url = f"{CONFIG['BASE_URL']}/user/instance_control.do"
+        params = {
+            'token': token,
+            'id': instance_id,
+            '_senkinlxc_password': new_password
+        }
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers)
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+
 class TelegramBot:
     def __init__(self):
         self.vps_manager = VPSManager()
@@ -219,7 +289,6 @@ class TelegramBot:
 
         username = self.temp_credentials[user_id]['username']
 
-        # Attempt login
         result = await self.vps_manager.login(username, password)
 
         # Clean up temporary credentials
@@ -246,6 +315,48 @@ class TelegramBot:
 
         return ConversationHandler.END
 
+    async def receive_new_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle new password input"""
+        user_id = update.effective_user.id
+        new_password = update.message.text.strip()
+
+        await update.message.delete()
+
+        if len(new_password) < 6:  # FOR SAFETY :) - Mio
+            await update.message.reply_text(
+                "Password must be at least 6 characters long. Please try again:"
+            )
+            return WAITING_NEW_PASSWORD
+
+        instance_id = self.user_sessions[user_id].get('selected_instance')
+        result = await self.vps_manager.change_password(
+            self.user_sessions[user_id]['token'],
+            instance_id,
+            new_password
+        )
+
+        if result['success']:
+            keyboard = [[
+                InlineKeyboardButton("Back to Details", callback_data=f"show_details_{instance_id}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "Password changed successfully!",
+                reply_markup=reply_markup
+            )
+        else:
+            keyboard = [[
+                InlineKeyboardButton("Try Again", callback_data=f"passwd_{instance_id}"),
+                InlineKeyboardButton("Back to Details", callback_data=f"show_details_{instance_id}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                f"Failed to change password: {result.get('error')}",
+                reply_markup=reply_markup
+            )
+
+        return ConversationHandler.END
+
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancel the conversation."""
         user_id = update.effective_user.id
@@ -258,7 +369,6 @@ class TelegramBot:
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button presses."""
         query = update.callback_query
-        await query.answer()
 
         if query.data == "list_instances":
             await self.show_instances(query)
@@ -288,6 +398,149 @@ For support, contact @YourUsername
         elif query.data.startswith(("boot_", "stop_", "reboot_")):
             action, instance_id = query.data.split("_")
             await self.handle_power_action(query, action, instance_id)
+
+        elif query.data.startswith("confirm_power_"):
+            _, _, action, instance_id = query.data.split("_")
+            result = await self.vps_manager.power_control(
+                self.user_sessions[query.from_user.id]['token'],
+                instance_id,
+                action
+            )
+            if result['success']:
+                await query.edit_message_text(
+                    f"Power action {action} initiated successfully.\nPlease wait a moment...",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Back to Details", callback_data=f"show_details_{instance_id}")
+                    ]])
+                )
+            else:
+                await query.edit_message_text(
+                    f"Failed to execute power action: {result.get('error')}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Back to Details", callback_data=f"show_details_{instance_id}")
+                    ]])
+                )
+
+        elif query.data.startswith("ports_"):
+            instance_id = query.data.split("_")[1]
+            result = await self.vps_manager.get_instance_details(
+                self.user_sessions[query.from_user.id]['token'],
+                instance_id
+            )
+
+            message = "🔹 Port Management\n\n"
+            if result['success'] and result['ports']:
+                message += "Current Port Forwards:\n"
+                for port in result['ports']:
+                    message += f"• {port['protocol'].upper()}: "
+                    message += f"{port['internal_addr']} → {port['external_addr']}\n"
+                message += "\nSelect an action:\n"
+            else:
+                message += "No port forwarding rules configured.\n\nSelect an action:\n"
+
+            keyboard = [[InlineKeyboardButton("📌 Add Port Forward", callback_data=f"add_port_{instance_id}")]]
+
+            if result['success'] and result['ports']:
+                for port in result['ports']:
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"🗑️ Delete {port['protocol'].upper()} {port['internal_addr']} → {port['external_addr']}",
+                            callback_data=f"del_port_{instance_id}_{port['protocol']}_{port['internal_addr'].split(':')[1]}_{port['external_addr'].split(':')[1]}"
+                        )
+                    ])
+
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Details", callback_data=f"show_details_{instance_id}")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data.startswith("add_port_"):
+            instance_id = query.data.split("_")[2]
+            self.user_sessions[query.from_user.id]['port_forward'] = {
+                'instance_id': instance_id,
+                'stage': 'protocol'
+            }
+            keyboard = [
+                [
+                    InlineKeyboardButton("TCP", callback_data=f"port_protocol_tcp_{instance_id}"),
+                    InlineKeyboardButton("UDP", callback_data=f"port_protocol_udp_{instance_id}")
+                ],
+                [InlineKeyboardButton("Cancel", callback_data=f"show_details_{instance_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Please select protocol:",
+                reply_markup=reply_markup
+            )
+        elif query.data.startswith("port_protocol_"):
+            _, _, protocol, instance_id = query.data.split("_")
+            self.user_sessions[query.from_user.id]['port_forward'].update({
+                'protocol': protocol
+            })
+            await query.edit_message_text(
+                f"Selected protocol: {protocol.upper()}\n"
+                "Please enter internal port number (1-65535):"
+            )
+            return WAITING_INTERNAL_PORT
+
+        elif query.data.startswith("del_port_"):
+            _, _, instance_id, protocol, internal_port, external_port = query.data.split("_")
+            keyboard = [
+                [
+                    InlineKeyboardButton("Confirm Delete",
+                                         callback_data=f"confirm_del_port_{instance_id}_{protocol}_{internal_port}_{external_port}"),
+                    InlineKeyboardButton("Cancel", callback_data=f"show_details_{instance_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Are you sure you want to delete port forwarding rule?\n"
+                f"Protocol: {protocol.upper()}\n"
+                f"Internal Port: {internal_port}\n"
+                f"External Port: {external_port}",
+                reply_markup=reply_markup
+            )
+
+        elif query.data.startswith("confirm_del_port_"):
+            _, _, _, instance_id, protocol, internal_port, external_port = query.data.split("_")
+            result = await self.vps_manager.delete_port_forward(
+                self.user_sessions[query.from_user.id]['token'],
+                instance_id,
+                protocol,
+                internal_port,
+                external_port
+            )
+
+            if result['success']:
+                await query.edit_message_text(
+                    "Port forwarding rule deleted successfully!\nRefreshing...",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Please wait...", callback_data="dummy")
+                    ]])
+                )
+            else:
+                await query.edit_message_text(
+                    f"Failed to delete port: {result.get('error')}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Back to Details", callback_data=f"show_details_{instance_id}")
+                    ]])
+                )
+
+            if result['success']:
+                await asyncio.sleep(1)
+                await self.show_instance_details(query)
+
+        elif query.data.startswith("passwd_"):
+            instance_id = query.data.split("_")[1]
+            await query.edit_message_text(
+                "Please enter new password for your VPS:\n"
+                "(Password must be at least 6 characters long)",
+            )
+            return WAITING_NEW_PASSWORD
 
     async def show_instances(self, query) -> None:
         """Show VPS instances list."""
@@ -353,21 +606,25 @@ For support, contact @YourUsername
             message += "🔹 Port Forwarding:\n"
             if result['ports']:
                 for port in result['ports']:
-                    message += f"Port {port['id']}: {port['protocol'].upper()} "
+                    message += f"#{port['id']}: {port['protocol'].upper()} "
                     message += f"{port['internal_addr']} → {port['external_addr']}\n"
             else:
                 message += "No port forwarding rules configured\n"
 
             keyboard = [
                 [
-                    InlineKeyboardButton("Power Management", callback_data=f"power_{instance_id}"),
-                    InlineKeyboardButton("Port Management", callback_data=f"ports_{instance_id}")
+                    InlineKeyboardButton("▶️ Start", callback_data=f"boot_{instance_id}"),
+                    InlineKeyboardButton("🔄 Restart", callback_data=f"reboot_{instance_id}"),
+                    InlineKeyboardButton("⏹ Stop", callback_data=f"stop_{instance_id}")
                 ],
                 [
-                    InlineKeyboardButton("Change Password", callback_data=f"passwd_{instance_id}"),
-                    InlineKeyboardButton("Reinstall System", callback_data=f"reinstall_{instance_id}")
+                    InlineKeyboardButton("Port Management", callback_data=f"ports_{instance_id}"),
+                    InlineKeyboardButton("Change Password", callback_data=f"passwd_{instance_id}")
                 ],
-                [InlineKeyboardButton("Back to List", callback_data="list_instances")]
+                [
+                    InlineKeyboardButton("Reinstall System", callback_data=f"reinstall_{instance_id}"),
+                    InlineKeyboardButton("Back to List", callback_data="list_instances")
+                ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -392,7 +649,6 @@ For support, contact @YourUsername
             await update.message.reply_text("Please login first!")
             return
 
-        # Get all instances and find the matching one
         result = await self.vps_manager.get_instances(self.user_sessions[user_id]['token'])
         if result['success']:
             matching_instance = None
@@ -438,16 +694,130 @@ For support, contact @YourUsername
             reply_markup=reply_markup
         )
 
+    async def handle_password_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle password change initiation"""
+        query = update.callback_query
+        await query.answer()
+
+        instance_id = query.data.split("_")[1]
+        self.user_sessions[query.from_user.id]['selected_instance'] = instance_id
+
+        await query.edit_message_text(
+            "Please enter new password for your VPS:\n"
+            "(Password must be at least 6 characters long)"
+        )
+        return WAITING_NEW_PASSWORD
+
+    async def receive_internal_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user_id = update.effective_user.id
+        port = update.message.text.strip()
+
+        try:
+            port_num = int(port)
+            if 1 <= port_num <= 65535:
+                self.user_sessions[user_id]['port_forward']['internal_port'] = port
+                await update.message.reply_text(
+                    "Please enter external port number (40000-65500):"
+                )
+                return WAITING_EXTERNAL_PORT
+            else:
+                await update.message.reply_text(
+                    "Invalid port number. Please enter a number between 1 and 65535:"
+                )
+                return WAITING_INTERNAL_PORT
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid input. Please enter a valid port number:"
+            )
+            return WAITING_INTERNAL_PORT
+
+    async def handle_port_protocol(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle protocol selection for port forwarding"""
+        query = update.callback_query
+        await query.answer()
+
+        _, _, protocol, instance_id = query.data.split("_")
+        user_id = query.from_user.id
+
+        # Initialize port_forward data
+        if 'port_forward' not in self.user_sessions[user_id]:
+            self.user_sessions[user_id]['port_forward'] = {}
+
+        self.user_sessions[user_id]['port_forward'].update({
+            'protocol': protocol,
+            'instance_id': instance_id
+        })
+
+        await query.edit_message_text(
+            f"Selected protocol: {protocol.upper()}\n"
+            "Please enter internal port number (1-65535):"
+        )
+        return WAITING_INTERNAL_PORT
+
+    async def receive_external_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user_id = update.effective_user.id
+        port = update.message.text.strip()
+
+        try:
+            port_num = int(port)
+            if 40000 <= port_num <= 65500:
+                port_data = self.user_sessions[user_id]['port_forward']
+                result = await self.vps_manager.add_port_forward(
+                    self.user_sessions[user_id]['token'],
+                    port_data['instance_id'],
+                    port_data['protocol'],
+                    port_data['internal_port'],
+                    port
+                )
+
+                keyboard = [[
+                    InlineKeyboardButton(
+                        "Back to Details",
+                        callback_data=f"show_details_{port_data['instance_id']}"
+                    )
+                ]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                if result['success']:
+                    await update.message.reply_text(
+                        "Port forward rule added successfully!",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"Failed to add port forward: {result.get('error')}",
+                        reply_markup=reply_markup
+                    )
+
+                return ConversationHandler.END
+            else:
+                await update.message.reply_text(
+                    "Invalid port number. Please enter a number between 40000 and 65500:"
+                )
+                return WAITING_EXTERNAL_PORT
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid input. Please enter a valid port number:"
+            )
+            return WAITING_EXTERNAL_PORT
+
     def run(self):
         """Run the bot."""
         application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
 
         # Add conversation handler for login process
         conv_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self.start_login, pattern="^start_login$")],
+            entry_points=[
+                CallbackQueryHandler(self.start_login, pattern="^start_login$"),
+                CallbackQueryHandler(self.handle_port_protocol, pattern="^port_protocol_"),
+                CallbackQueryHandler(self.handle_password_change, pattern="^passwd_")
+            ],
             states={
                 WAITING_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_username)],
                 WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_password)],
+                WAITING_INTERNAL_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_internal_port)],
+                WAITING_EXTERNAL_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_external_port)],
+                WAITING_NEW_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_new_password)]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
@@ -458,7 +828,6 @@ For support, contact @YourUsername
         application.add_handler(conv_handler)
         application.add_handler(CallbackQueryHandler(self.button_handler))
 
-        # Start the bot
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
