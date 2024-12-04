@@ -117,29 +117,39 @@ class VPSManager:
             system_info = {}
             card = soup.find('el-card', {'class': 'box-card'})
             if card:
+                # 处理运行状态
                 status_font = card.find('font')
                 if status_font:
                     system_info['运行状态'] = status_font.text.strip()
 
+                # 获取所有文本内容
                 content = card.get_text('\n').strip()
-                lines = content.split('\n')
+                lines = [line.strip() for line in content.split('\n') if line.strip()]
 
-                current_key = None
-                for line in lines:
-                    line = line.strip()
-                    if not line or line == '基本信息':
-                        continue
+                for i, line in enumerate(lines):
+                    # 处理内网IP
+                    if line == '内网IP:' and i + 1 < len(lines):
+                        system_info['内网IP'] = lines[i + 1].strip()
 
-                    if line.endswith(':'):
-                        current_key = line[:-1].strip()
-                    elif current_key:
-                        value = line.replace('\n', '').replace('<br/>', '').strip()
-                        if value:
-                            system_info[current_key] = value
-                            current_key = None
+                    # 处理用户名
+                    elif line.startswith('用户名:'):
+                        system_info['用户名'] = line.replace('用户名:', '').strip()
 
-                if '用户名: ' in content:
-                    system_info['用户名'] = content.split('用户名: ')[1].split('\n')[0].strip()
+                    # 处理内存使用
+                    elif line == '内存使用:' and i + 2 < len(lines):
+                        used = lines[i + 1].strip()
+                        total = lines[i + 2].strip()
+                        system_info['内存使用'] = f"{used} {total}"
+
+                    # 处理硬盘使用
+                    elif line == '硬盘使用:' and i + 2 < len(lines):
+                        used = lines[i + 1].strip()
+                        total = lines[i + 2].strip()
+                        system_info['硬盘使用'] = f"{used} {total}"
+
+                    # 处理流量使用
+                    elif line.startswith('流量使用:'):
+                        system_info['流量使用'] = line.replace('流量使用:', '').strip()
 
             # Extract port forwarding information
             ports = []
