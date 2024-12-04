@@ -397,7 +397,7 @@ Available commands:
 /vps <name> - Show details of specific VPS
 /help - Show this help message
 
-For support, contact @YourUsername
+For support, contact @Nenechan0721
 """
             await query.edit_message_text(help_text)
         elif query.data.startswith("show_details_"):
